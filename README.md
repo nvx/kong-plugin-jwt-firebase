@@ -9,11 +9,12 @@ What we need to run this plugin is just the firebase project name.
 [Plugin development](https://docs.konghq.com/0.14.x/plugin-development/distribution/) by Kong
 ###### Install the plugin into Kong
 ```bash
-luarocks install https://github.com/hpsony94/kong-plugin-jwt-firebase/releases/download/1.0.0-1/kong-plugin-jwt-firebase-1.0.0-1.all.rock
+luarocks install TODO
 ```
 ###### Load the plugin by kong.conf file
 - By editting the kong.conf file 
 ```
+nginx_http_directives_lua_shared_dict jwt_firebase_keys 512k;
 plugins = bundled, jwt-firebase
 ```
 
@@ -68,13 +69,10 @@ $ curl -ik -X GET \
     --header 'Authorization: <token-id> '
 ```
 
-#### TODO: Improvement or Tech debt
-TBD
-
 #### How to release
 Create the Lua rock in current directory:
 ```sh
-$ luarock make
+$ luarocks make
 $ luarocks pack kong-plugin-jwt-firebase
 ```
 
