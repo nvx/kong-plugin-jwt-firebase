@@ -24,7 +24,36 @@ local shm = ngx.shared.jwt_firebase_keys
 local JwtHandler = {}
 
 JwtHandler.PRIORITY = 1201
-JwtHandler.VERSION = "1.0.0"
+JwtHandler.VERSION = "1.1.1"
+
+local function fetch_keys()
+    kong.log.debug("### fetch_keys()")
+
+    local httpc = http:new()
+    local res, err = httpc:request_uri("https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com", { method = "GET" })
+    if not res then
+        kong.log.err('Error getting public keys: ', err)
+        kong.response.exit(500)
+    end
+
+    if res.status ~= 200 then
+        kong.log.err('Error getting public keys, server returned not-200: ', res)
+        kong.response.exit(500)
+    end
+
+    local cache_duration = 60 * 60 * 1000 -- cache for 1 hour if we fail to parse the Cache-Control header
+    local cache_control_header = res.headers['cache-control']
+    local m, err = re_match(cache_control_header, "(^|,\\s*)max-age=([0-9]+)")
+    if m then
+        cache_duration = tonumber(m[2]) * 1000
+    else
+        kong.log.debug("### fetch_keys() failed to parse cache-control header")
+    end
+
+    shm:set("jwk-all", res.body, cache_duration)
+
+    return res.body
+end
 
 --- Grab a public key from google api by the kid value
 -- Grab the public key from https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com 
@@ -33,53 +62,30 @@ JwtHandler.VERSION = "1.0.0"
 local function grab_public_key_bykid(t_kid)
     kong.log.debug("### grab_public_key_bykid() " .. t_kid)
 
-    local key = shm:get(t_kid)
-    if key ~= nil then
+    local key = shm:get("jwk-" .. t_kid)
+    if key then
         return key
     end
 
-    kong.log.debug("### grab_public_key_bykid() cache miss " .. t_kid)
-
-    local httpc = http:new()
-    local res, err = httpc:request_uri("https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com", { method = "GET" })
-    if not res then
-        kong.log.err('[jwt-firebase] Error getting public keys: ', err)
-        kong.response.exit(500)
+    -- we cache the jwk endpoint too to avoid making a request if an unknown kid is specified
+    local json_keys = shm:get("jwk-all")
+    if json_keys == nil then
+        json_keys = fetch_keys()
     end
 
-    if res.status ~= 200 then
-        kong.log.err('[jwt-firebase] Error getting public keys, server returned not-200: ', res)
-        kong.response.exit(500)
-    end
-
-    local keys = cjson.decode(res.body)
+    local keys = cjson.decode(json_keys)
     if not keys then
-        kong.log.err('[jwt-firebase] Error decoding json keys: ', res.body)
+        kong.log.err('Error decoding json keys: ', res.body)
         kong.response.exit(500)
     end
 
-    for k, cert in pairs(keys) do
-        local x509cert, err = openssl_x509.new(cert)
-        if err ~= nil then
-            kong.log.err('[jwt-firebase] Error parsing certificate: ', err)
-            kong.response.exit(500)
-        end
-
-        local pkey, err = x509cert:get_pubkey()
-        if err ~= nil then
-            kong.log.err('[jwt-firebase] Error getting pubkey: ', err)
-            kong.response.exit(500)
-        end
-
-        local keyStr = pkey:tostring()
-        shm:set(k, keyStr, 21 * 24 * 60 * 60 * 1000) -- cache keys for 3 weeks
-
-        if k == t_kid then
-            key = keyStr
+    for _, jwk in pairs(keys.keys) do
+        if jwk.kid == t_kid then
+            local encoded = cjson.encode(jwk)
+            shm:set("jwk-" .. t_kid, encoded, 24 * 60 * 60 * 1000) -- cache the encoded key itself too for faster access
+            return encoded
         end
     end
-
-    return key
 end
 
 --- Retrieve a JWT in a request.
@@ -111,19 +117,7 @@ local function retrieve_token(conf)
         if not m then
             return authorization_header
         end
-        local iterator, iter_err = re_gmatch(authorization_header, "\\s*[Bb]earer\\s+(.+)")
-        if not iterator then
-            return nil, iter_err
-        end
-
-        local m, err = iterator()
-        if err then
-            return nil, err
-        end
-
-        if m and #m > 0 then
-            return m[1]
-        end
+        return m[1]
     end
 end
 
