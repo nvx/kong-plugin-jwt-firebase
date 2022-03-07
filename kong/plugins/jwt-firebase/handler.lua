@@ -24,7 +24,7 @@ local shm = ngx.shared.jwt_firebase_keys
 local JwtHandler = {}
 
 JwtHandler.PRIORITY = 1201
-JwtHandler.VERSION = "1.1.1"
+JwtHandler.VERSION = "1.1.2"
 
 local function fetch_keys()
     kong.log.debug("### fetch_keys()")
@@ -273,9 +273,9 @@ local function do_authentication(conf)
 
     for _, claim in pairs(conf.returned_claims) do
         if jwt.claims[claim] ~= nil then
-            set_header('X-Firebase-' .. claim:gsub('_', '%-'), jwt.claims[claim])
+            set_header('X-Claim-' .. claim:gsub('_', '%-'), jwt.claims[claim])
         else
-            clear_header('X-Firebase-' .. claim:gsub('_', '%-'))
+            clear_header('X-Claim-' .. claim:gsub('_', '%-'))
         end
     end
 

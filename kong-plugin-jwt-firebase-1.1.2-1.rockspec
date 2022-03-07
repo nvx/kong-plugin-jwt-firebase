@@ -1,5 +1,5 @@
 package = "kong-plugin-jwt-firebase"
-version = "1.1.1-1"
+version = "1.1.2-1"
 source = {
     url = "https://github.com/nvx/kong-plugin-jwt-firebase",
 }
