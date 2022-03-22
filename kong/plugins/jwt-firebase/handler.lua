@@ -3,7 +3,6 @@ local http = require "resty.http"
 local constants = require "kong.constants"
 local local_constants = require "kong.plugins.jwt-firebase.constants"
 local jwt_decoder = require "kong.plugins.jwt.jwt_parser"
-local openssl_x509 = require "resty.openssl.x509"
 
 local to_hex = require "resty.string".to_hex
 local fmt = string.format
@@ -13,7 +12,6 @@ local type = type
 local pairs = pairs
 local ipairs = ipairs
 local tostring = tostring
-local re_gmatch = ngx.re.gmatch
 local re_match = ngx.re.match
 local ngx_set_header = ngx.req.set_header
 local set_header = kong.service.request.set_header
@@ -24,7 +22,7 @@ local shm = ngx.shared.jwt_firebase_keys
 local JwtHandler = {}
 
 JwtHandler.PRIORITY = 1201
-JwtHandler.VERSION = "1.1.2"
+JwtHandler.VERSION = "1.2.0"
 
 local function fetch_keys()
     kong.log.debug("### fetch_keys()")
@@ -41,11 +39,11 @@ local function fetch_keys()
         kong.response.exit(500)
     end
 
-    local cache_duration = 60 * 60 * 1000 -- cache for 1 hour if we fail to parse the Cache-Control header
+    local cache_duration = 60 * 60 -- cache for 1 hour (in seconds) if we fail to parse the Cache-Control header
     local cache_control_header = res.headers['cache-control']
     local m, err = re_match(cache_control_header, "(^|,\\s*)max-age=([0-9]+)")
     if m then
-        cache_duration = tonumber(m[2]) * 1000
+        cache_duration = tonumber(m[2])
     else
         kong.log.debug("### fetch_keys() failed to parse cache-control header")
     end
@@ -173,24 +171,24 @@ local function do_authentication(conf)
     local token, err = retrieve_token(conf)
     if err then
         kong.log.err(err)
-        return kong.response.exit(500, { message = "An unexpected error occurred" })
+        return kong.response.exit(500, { message = "an unexpected error occurred" })
     end
 
     local token_type = type(token)
     if token_type ~= "string" then
         if token_type == "nil" then
-            return false, { status = 401, message = "Unauthorized" }
+            return false, { status = 401, message = "unauthorized" }
         elseif token_type == "table" then
-            return false, { status = 401, message = "Multiple tokens provided" }
+            return false, { status = 401, message = "multiple tokens provided" }
         else
-            return false, { status = 401, message = "Unrecognizable token" }
+            return false, { status = 401, message = "unrecognizable token" }
         end
     end
 
     -- Decode token
     local jwt, err = jwt_decoder:new(token)
     if err then
-        return false, { status = 401, message = "Bad token; " .. tostring(err) }
+        return false, { status = 401, message = "bad token; " .. tostring(err) }
     end
 
     -- Verify Header
@@ -198,7 +196,7 @@ local function do_authentication(conf)
     local hd_alg = jwt.header.alg
     kong.log.debug("### header.alg: " .. hd_alg)
     if not hd_alg or hd_alg ~= "RS256" then
-        return false, { status = 401, message = "Invalid algorithm" }
+        return false, { status = 401, message = "invalid algorithm" }
     end
 
     -- Verify Payload
@@ -208,14 +206,14 @@ local function do_authentication(conf)
     local conf_iss = "https://securetoken.google.com/" .. conf.project_id
     kong.log.debug("### conf_iss: " .. conf_iss)
     if not pl_iss or pl_iss ~= conf_iss then
-        return false, { status = 401, message = "Invalid iss in the header" }
+        return false, { status = 401, message = "invalid iss in the header" }
     end
     -- -- Verify the "aud"
     local pl_aud = jwt.claims.aud
     kong.log.debug("### payload.aud: " .. pl_aud)
     kong.log.debug("### conf.project_id: " .. conf.project_id)
     if not pl_aud or pl_aud ~= conf.project_id then
-        return false, { status = 401, message = "Invalid aud in the header" }
+        return false, { status = 401, message = "invalid aud in the header" }
     end
     -- -- Verify the "exp"
     kong.log.debug("### Checking exp ... ")
@@ -247,17 +245,38 @@ local function do_authentication(conf)
     -- Now verify the JWT signature
     local public_key = grab_public_key_bykid(jwt.header.kid)
     if public_key == nil then
-        return false, { status = 401, message = "unknown kid" }
+        return false, { status = 401, message = "unknown kid: " .. jwt.header.kid }
     end
 
     if not jwt:verify_signature(public_key) then
-        return false, { status = 401, message = "Invalid signature" }
+        return false, { status = 401, message = "invalid signature" }
     end
 
-    if conf.uid_claim ~= "sub" then
-        pl_sub = jwt.claims[conf.uid_claim]
+    if conf.uid_from == "claim" then
+        if conf.uid_field ~= "sub" then
+            pl_sub = jwt.claims[conf.uid_field]
+            if not pl_sub then
+                return false, { status = 401, message = "missing required uid claim" }
+            end
+        end
+    elseif conf.uid_from == "identities" then
+        pl_sub = nil
+        -- assume we only have one value
+        if jwt.claims.firebase ~= nil and jwt.claims.firebase.identities ~= nil and
+                jwt.claims.firebase.identities[conf.uid_field] ~= nil and
+                #jwt.claims.firebase.identities[conf.uid_field] == 1 then
+            pl_sub = jwt.claims.firebase.identities[conf.uid_field][1]
+        end
         if not pl_sub then
-            return false, { status = 401, message = "missing required uid claim" }
+            return false, { status = 401, message = "missing required uid identity" }
+        end
+    elseif conf.uid_from == "sign_in_attributes" then
+        pl_sub = nil
+        if jwt.claims.firebase ~= nil and jwt.claims.firebase.sign_in_attributes ~= nil then
+            pl_sub = jwt.claims.firebase.sign_in_attributes[conf.uid_field]
+        end
+        if not pl_sub then
+            return false, { status = 401, message = "missing required uid attribute" }
         end
     end
 
@@ -272,10 +291,20 @@ local function do_authentication(conf)
     end
 
     for _, claim in pairs(conf.returned_claims) do
+        local header_name = local_constants.HEADERS.CLAIM_PREFIX .. claim:gsub('_', '%-')
         if jwt.claims[claim] ~= nil then
-            set_header('X-Claim-' .. claim:gsub('_', '%-'), jwt.claims[claim])
+            set_header(header_name, jwt.claims[claim])
         else
-            clear_header('X-Claim-' .. claim:gsub('_', '%-'))
+            clear_header(header_name)
+        end
+    end
+
+    for _, claim in pairs(conf.returned_sign_in_attributes) do
+        local header_name = local_constants.HEADERS.CLAIM_PREFIX .. claim:gsub('_', '%-')
+        if jwt.claims.firebase ~= nil and jwt.claims.firebase.sign_in_attributes[claim] ~= nil then
+            set_header(header_name, jwt.claims.firebase.sign_in_attributes[claim])
+        else
+            clear_header(header_name)
         end
     end
 
